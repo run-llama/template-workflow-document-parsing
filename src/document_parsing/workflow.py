@@ -1,8 +1,11 @@
+import os
+from pathlib import Path
+from typing import Annotated, Literal
+
+from llama_cloud import AsyncLlamaCloud
 from pydantic import BaseModel
-from typing import Annotated
-from llama_cloud_services import LlamaParse
-from workflows import Workflow, step, Context
-from workflows.events import StartEvent, Event, StopEvent
+from workflows import Context, Workflow, step
+from workflows.events import Event, StartEvent, StopEvent
 from workflows.resource import Resource
 
 
@@ -18,43 +21,40 @@ class ParseDocumentAgenticPlusEvent(Event):
     pass
 
 
-async def get_llama_parse_cost_effective(*args, **kwargs) -> LlamaParse:
-    return LlamaParse(
-        parse_mode="parse_page_with_llm",
-        high_res_ocr=True,
-        adaptive_long_table=True,
-        outlined_table_extraction=True,
-        output_tables_as_HTML=True,
-        result_type="markdown",
-    )
+# required for all llama cloud calls
+LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
+# get this in case running against a different environment than production
+LLAMA_CLOUD_BASE_URL = os.getenv("LLAMA_CLOUD_BASE_URL")
+LLAMA_CLOUD_PROJECT_ID = os.getenv("LLAMA_DEPLOY_PROJECT_ID")
 
 
-async def get_llama_parse_agentic(*args, **kwargs) -> LlamaParse:
-    return LlamaParse(
-        parse_mode="parse_page_with_agent",
-        model="openai-gpt-4-1-mini",
-        high_res_ocr=True,
-        adaptive_long_table=True,
-        outlined_table_extraction=True,
-        output_tables_as_HTML=True,
-        result_type="markdown",
-    )
-
-
-async def get_llama_parse_agentic_plus(*args, **kwargs) -> LlamaParse:
-    return LlamaParse(
-        parse_mode="parse_page_with_agent",
-        model="anthropic-sonnet-4.0",
-        high_res_ocr=True,
-        adaptive_long_table=True,
-        outlined_table_extraction=True,
-        output_tables_as_HTML=True,
-        result_type="markdown",
+async def get_llama_cloud_client(*args, **kwargs) -> AsyncLlamaCloud:
+    return AsyncLlamaCloud(
+        api_key=LLAMA_CLOUD_API_KEY,
+        base_url=LLAMA_CLOUD_BASE_URL,
+        default_headers={"Project-Id": LLAMA_CLOUD_PROJECT_ID}
+        if LLAMA_CLOUD_PROJECT_ID
+        else {},
     )
 
 
 class DocumentProcessingState(BaseModel):
     document_path: str = ""
+
+
+async def _parse_document(
+    client: AsyncLlamaCloud,
+    document_path: str,
+    tier: Literal["fast", "cost_effective", "agentic", "agentic_plus"],
+) -> str:
+    with Path(document_path).open("rb") as f:
+        result = await client.parsing.parse(
+            tier=tier,
+            version="latest",
+            upload_file=(Path(document_path).name, f.read()),
+            expand=["markdown_full"],
+        )
+    return result.markdown_full or ""
 
 
 class DocumentProcessingWorkflow(Workflow):
@@ -80,17 +80,10 @@ class DocumentProcessingWorkflow(Workflow):
         self,
         ev: ParseDocumentCostEffectiveEvent,
         ctx: Context[DocumentProcessingState],
-        parser: Annotated[LlamaParse, Resource(get_llama_parse_cost_effective)],
+        client: Annotated[AsyncLlamaCloud, Resource(get_llama_cloud_client)],
     ) -> StopEvent:
         state = await ctx.store.get_state()
-        result = await parser.aparse(state.document_path)
-        if isinstance(result, list):
-            documents = []
-            for r in result:
-                documents.extend(await r.aget_markdown_documents())
-        else:
-            documents = await result.aget_markdown_documents()
-        text = "\\n\\n---\\n\\n".join([document.text for document in documents])
+        text = await _parse_document(client, state.document_path, "cost_effective")
         return StopEvent(result=text)
 
     @step
@@ -98,17 +91,10 @@ class DocumentProcessingWorkflow(Workflow):
         self,
         ev: ParseDocumentAgenticEvent,
         ctx: Context[DocumentProcessingState],
-        parser: Annotated[LlamaParse, Resource(get_llama_parse_agentic)],
+        client: Annotated[AsyncLlamaCloud, Resource(get_llama_cloud_client)],
     ) -> StopEvent:
         state = await ctx.store.get_state()
-        result = await parser.aparse(state.document_path)
-        if isinstance(result, list):
-            documents = []
-            for r in result:
-                documents.extend(await r.aget_markdown_documents())
-        else:
-            documents = await result.aget_markdown_documents()
-        text = "\\n\\n---\\n\\n".join([document.text for document in documents])
+        text = await _parse_document(client, state.document_path, "agentic")
         return StopEvent(result=text)
 
     @step
@@ -116,17 +102,10 @@ class DocumentProcessingWorkflow(Workflow):
         self,
         ev: ParseDocumentAgenticPlusEvent,
         ctx: Context[DocumentProcessingState],
-        parser: Annotated[LlamaParse, Resource(get_llama_parse_agentic_plus)],
+        client: Annotated[AsyncLlamaCloud, Resource(get_llama_cloud_client)],
     ) -> StopEvent:
         state = await ctx.store.get_state()
-        result = await parser.aparse(state.document_path)
-        if isinstance(result, list):
-            documents = []
-            for r in result:
-                documents.extend(await r.aget_markdown_documents())
-        else:
-            documents = await result.aget_markdown_documents()
-        text = "\\n\\n---\\n\\n".join([document.text for document in documents])
+        text = await _parse_document(client, state.document_path, "agentic_plus")
         return StopEvent(result=text)
 
 
@@ -141,7 +120,6 @@ async def main(document_path: str, parsing_mode: str) -> None:
 workflow = DocumentProcessingWorkflow(timeout=None)
 
 if __name__ == "__main__":
-    import os
     import asyncio
     from argparse import ArgumentParser
 
